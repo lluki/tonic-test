@@ -114,9 +114,6 @@ impl pb::echo_server::Echo for EchoServer {
         let resp_rx = std::mem::take(xx).unwrap();
         let out_stream: ReceiverStream<Result<EchoResponse, Status>> = ReceiverStream::new(resp_rx);
 
-        //let mut x = self.resp_tx.lock().expect("Lock");
-        //*x = Some(resp_tx);
-
         Ok(Response::new(
             Box::pin(out_stream) as Self::BidirectionalStreamingEchoStream
         ))
@@ -190,12 +187,16 @@ async fn connect() -> Result<EchoServerClient, Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut client = connect().await?;
-    let _req = client.recv().await?;
-    client
-        .send(EchoResponse {
-            message: "Rando responso!".into(),
-        })
-        .await;
+
+    loop {
+        let req = client.recv().await?;
+        println!("Received {:?}", req);
+        client
+            .send(EchoResponse {
+                message: format!("~~~###!!! {:?} !!!###~~~", req.message),
+            })
+            .await;
+    }
 
     Ok(())
 }
