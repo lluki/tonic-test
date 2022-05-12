@@ -3,8 +3,10 @@ pub mod pb {
 }
 
 use futures::Stream;
-use std::{error::Error, io::ErrorKind, net::ToSocketAddrs, pin::Pin, time::Duration};
-use tokio::sync::mpsc;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex};
+use std::{error::Error, io::ErrorKind, net::ToSocketAddrs, pin::Pin};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{transport::Server, Request, Response, Status, Streaming};
 
@@ -37,7 +39,11 @@ fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
 }
 
 #[derive(Debug)]
-pub struct EchoServer {}
+pub struct EchoServer {
+    cmd_tx: Sender<Result<EchoRequest, Status>>,
+    resp_tx: Arc<Mutex<Option<Sender<Result<EchoResponse, Status>>>>>,
+    //resp_rx: Mutex<Receiver<Result<EchoResponse, Status>>>,
+}
 
 #[tonic::async_trait]
 impl pb::echo_server::Echo for EchoServer {
@@ -51,37 +57,7 @@ impl pb::echo_server::Echo for EchoServer {
         &self,
         req: Request<EchoRequest>,
     ) -> EchoResult<Self::ServerStreamingEchoStream> {
-        println!("EchoServer::server_streaming_echo");
-        println!("\tclient connected from: {:?}", req.remote_addr());
-
-        // creating infinite stream with requested message
-        let repeat = std::iter::repeat(EchoResponse {
-            message: req.into_inner().message,
-        });
-        let mut stream = Box::pin(tokio_stream::iter(repeat).throttle(Duration::from_millis(200)));
-
-        // spawn and channel are required if you want handle "disconnect" functionality
-        // the `out_stream` will not be polled after client disconnect
-        let (tx, rx) = mpsc::channel(128);
-        tokio::spawn(async move {
-            while let Some(item) = stream.next().await {
-                match tx.send(Result::<_, Status>::Ok(item)).await {
-                    Ok(_) => {
-                        // item (server response) was queued to be send to client
-                    }
-                    Err(_item) => {
-                        // output_stream was build from rx and both are dropped
-                        break;
-                    }
-                }
-            }
-            println!("\tclient disconnected");
-        });
-
-        let output_stream = ReceiverStream::new(rx);
-        Ok(Response::new(
-            Box::pin(output_stream) as Self::ServerStreamingEchoStream
-        ))
+        Err(Status::unimplemented("not implemented"))
     }
 
     async fn client_streaming_echo(
@@ -100,7 +76,8 @@ impl pb::echo_server::Echo for EchoServer {
         println!("EchoServer::bidirectional_streaming_echo");
 
         let mut in_stream = req.into_inner();
-        let (tx, rx) = mpsc::channel(128);
+
+        let cmd_tx2 = self.cmd_tx.clone();
 
         // this spawn here is required if you want to handle connection error.
         // If we just map `in_stream` and write it back as `out_stream` the `out_stream`
@@ -109,10 +86,7 @@ impl pb::echo_server::Echo for EchoServer {
         tokio::spawn(async move {
             while let Some(result) = in_stream.next().await {
                 match result {
-                    Ok(v) => tx
-                        .send(Ok(EchoResponse { message: v.message }))
-                        .await
-                        .expect("working rx"),
+                    Ok(v) => cmd_tx2.send(Ok(v)).await.expect("working rx"),
                     Err(err) => {
                         if let Some(io_err) = match_for_io_error(&err) {
                             if io_err.kind() == ErrorKind::BrokenPipe {
@@ -123,7 +97,7 @@ impl pb::echo_server::Echo for EchoServer {
                             }
                         }
 
-                        match tx.send(Err(err)).await {
+                        match cmd_tx2.send(Err(err)).await {
                             Ok(_) => (),
                             Err(_err) => break, // response was droped
                         }
@@ -133,8 +107,12 @@ impl pb::echo_server::Echo for EchoServer {
             println!("\tstream ended");
         });
 
-        // echo just write the same data that was received
-        let out_stream = ReceiverStream::new(rx);
+        // Create response channel and shove receiving end into self
+        let (resp_tx, resp_rx) = mpsc::channel(4);
+        let out_stream: ReceiverStream<Result<EchoResponse, Status>> = ReceiverStream::new(resp_rx);
+
+        let mut x = self.resp_tx.lock().expect("Lock");
+        *x = Some(resp_tx);
 
         Ok(Response::new(
             Box::pin(out_stream) as Self::BidirectionalStreamingEchoStream
@@ -142,14 +120,53 @@ impl pb::echo_server::Echo for EchoServer {
     }
 }
 
+impl EchoServer {
+    async fn send(self, resp: EchoResponse) -> () {
+        let tx = self.resp_tx.lock().expect("Lock2");
+        match tx.deref() {
+            Some(tx) => tx.send(Ok(resp)).await.unwrap(),
+            None => panic!("resp_tx is None?!"),
+        };
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let server = EchoServer {};
-    Server::builder()
-        .add_service(pb::echo_server::EchoServer::new(server))
-        .serve("[::1]:50051".to_socket_addrs().unwrap().next().unwrap())
-        .await
-        .unwrap();
+    let resp_tx = Arc::new(Mutex::new(None));
+    let resp_tx2 = resp_tx.clone();
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+    let server = EchoServer { cmd_tx, resp_tx };
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(pb::echo_server::EchoServer::new(server))
+            .serve("[::1]:50051".to_socket_addrs().unwrap().next().unwrap())
+            .await
+            .unwrap();
+    });
+
+    println!("After Server::builder!");
+
+    //server.send(EchoResponse {
+    //    message: "Oh this is a random response!".into(),
+    //});
+
+    loop {
+        // this should go into recv()
+        let receive = cmd_rx.recv().await;
+        let req = receive.unwrap().unwrap();
+        println!("Received {:?}", req);
+
+        // this should go into send()
+        let resp = EchoResponse {
+            message: "Oh this is a random response!".into(),
+        };
+        let tx = resp_tx2.lock().expect("Lock2");
+        match tx.deref() {
+            Some(tx) => tx.send(Ok(resp)).await.unwrap(),
+            None => panic!("resp_tx is None?!"),
+        };
+    }
 
     Ok(())
 }
