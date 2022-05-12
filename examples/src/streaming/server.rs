@@ -3,8 +3,7 @@ pub mod pb {
 }
 
 use futures::Stream;
-use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::{error::Error, io::ErrorKind, net::ToSocketAddrs, pin::Pin};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -41,7 +40,8 @@ fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
 #[derive(Debug)]
 pub struct EchoServer {
     cmd_tx: Sender<Result<EchoRequest, Status>>,
-    // This will be None once we use it as response
+    // While the server is initializing, this holds the Response receiver.
+    // After initialization, it will hold None
     resp_rx: Mutex<Option<Receiver<Result<EchoResponse, Status>>>>,
 }
 
@@ -55,7 +55,7 @@ impl pb::echo_server::Echo for EchoServer {
 
     async fn server_streaming_echo(
         &self,
-        req: Request<EchoRequest>,
+        _req: Request<EchoRequest>,
     ) -> EchoResult<Self::ServerStreamingEchoStream> {
         Err(Status::unimplemented("not implemented"))
     }
@@ -76,8 +76,7 @@ impl pb::echo_server::Echo for EchoServer {
         println!("EchoServer::bidirectional_streaming_echo");
 
         let mut in_stream = req.into_inner();
-
-        let cmd_tx2 = self.cmd_tx.clone();
+        let cmd_tx = self.cmd_tx.clone();
 
         // this spawn here is required if you want to handle connection error.
         // If we just map `in_stream` and write it back as `out_stream` the `out_stream`
@@ -86,7 +85,7 @@ impl pb::echo_server::Echo for EchoServer {
         tokio::spawn(async move {
             while let Some(result) = in_stream.next().await {
                 match result {
-                    Ok(v) => cmd_tx2.send(Ok(v)).await.expect("working rx"),
+                    Ok(v) => cmd_tx.send(Ok(v)).await.expect("working rx"),
                     Err(err) => {
                         if let Some(io_err) = match_for_io_error(&err) {
                             if io_err.kind() == ErrorKind::BrokenPipe {
@@ -97,7 +96,7 @@ impl pb::echo_server::Echo for EchoServer {
                             }
                         }
 
-                        match cmd_tx2.send(Err(err)).await {
+                        match cmd_tx.send(Err(err)).await {
                             Ok(_) => (),
                             Err(_err) => break, // response was droped
                         }
@@ -107,11 +106,10 @@ impl pb::echo_server::Echo for EchoServer {
             println!("\tstream ended");
         });
 
-        // Create response channel and shove receiving end into self
-        //let (resp_tx, resp_rx) = mpsc::channel(4);
+        // `take` whats inside self.resp_rx
         let mut locked = self.resp_rx.lock();
-        let xx: &mut Option<_> = locked.as_deref_mut().unwrap();
-        let resp_rx = std::mem::take(xx).unwrap();
+        let opt: &mut Option<_> = locked.as_deref_mut().unwrap();
+        let resp_rx = std::mem::take(opt).unwrap();
         let out_stream: ReceiverStream<Result<EchoResponse, Status>> = ReceiverStream::new(resp_rx);
 
         Ok(Response::new(
@@ -128,11 +126,6 @@ pub struct EchoServerClient {
 impl EchoServerClient {
     async fn send(&self, resp: EchoResponse) -> () {
         self.resp_tx.send(Ok(resp)).await.unwrap()
-        //let tx = self.resp_tx.lock().expect("Lock2");
-        //match tx.deref() {
-        //    Some(tx) =>
-        //    None => panic!("resp_tx is None?!"),
-        //};
     }
 
     async fn recv(&mut self) -> Result<EchoRequest, Status> {
@@ -141,8 +134,6 @@ impl EchoServerClient {
 }
 
 async fn connect() -> Result<EchoServerClient, Box<dyn std::error::Error>> {
-    //let resp_tx = Arc::new(Mutex::new(None));
-    //let resp_tx2 = resp_tx.clone();
     let (resp_tx, resp_rx) = mpsc::channel(4);
     let (cmd_tx, cmd_rx) = mpsc::channel(4);
     let server = EchoServer {
@@ -159,27 +150,6 @@ async fn connect() -> Result<EchoServerClient, Box<dyn std::error::Error>> {
     });
 
     println!("After Server::builder!");
-
-    //server.send(EchoResponse {
-    //    message: "Oh this is a random response!".into(),
-    //});
-
-    //loop {
-    //    // this should go into recv()
-    //    let receive = cmd_rx.recv().await;
-    //    let req = receive.unwrap().unwrap();
-    //    println!("Received {:?}", req);
-
-    //    // this should go into send()
-    //    let resp = EchoResponse {
-    //        message: "Oh this is a random response!".into(),
-    //    };
-    //    let tx = resp_tx2.lock().expect("Lock2");
-    //    match tx.deref() {
-    //        Some(tx) => tx.send(Ok(resp)).await.unwrap(),
-    //        None => panic!("resp_tx is None?!"),
-    //    };
-    //}
 
     Ok(EchoServerClient { cmd_rx, resp_tx })
 }
