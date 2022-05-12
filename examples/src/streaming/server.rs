@@ -41,7 +41,8 @@ fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
 #[derive(Debug)]
 pub struct EchoServer {
     cmd_tx: Sender<Result<EchoRequest, Status>>,
-    resp_tx: Arc<Mutex<Option<Sender<Result<EchoResponse, Status>>>>>,
+    // This will be None once we use it as response
+    resp_rx: Mutex<Option<Receiver<Result<EchoResponse, Status>>>>,
 }
 
 #[tonic::async_trait]
@@ -107,11 +108,14 @@ impl pb::echo_server::Echo for EchoServer {
         });
 
         // Create response channel and shove receiving end into self
-        let (resp_tx, resp_rx) = mpsc::channel(4);
+        //let (resp_tx, resp_rx) = mpsc::channel(4);
+        let mut locked = self.resp_rx.lock();
+        let xx: &mut Option<_> = locked.as_deref_mut().unwrap();
+        let resp_rx = std::mem::take(xx).unwrap();
         let out_stream: ReceiverStream<Result<EchoResponse, Status>> = ReceiverStream::new(resp_rx);
 
-        let mut x = self.resp_tx.lock().expect("Lock");
-        *x = Some(resp_tx);
+        //let mut x = self.resp_tx.lock().expect("Lock");
+        //*x = Some(resp_tx);
 
         Ok(Response::new(
             Box::pin(out_stream) as Self::BidirectionalStreamingEchoStream
@@ -125,7 +129,7 @@ pub struct EchoServerClient {
 }
 
 impl EchoServerClient {
-    async fn send(self, resp: EchoResponse) -> () {
+    async fn send(&self, resp: EchoResponse) -> () {
         self.resp_tx.send(Ok(resp)).await.unwrap()
         //let tx = self.resp_tx.lock().expect("Lock2");
         //match tx.deref() {
@@ -133,13 +137,21 @@ impl EchoServerClient {
         //    None => panic!("resp_tx is None?!"),
         //};
     }
+
+    async fn recv(&mut self) -> Result<EchoRequest, Status> {
+        self.cmd_rx.recv().await.unwrap()
+    }
 }
 
 async fn connect() -> Result<EchoServerClient, Box<dyn std::error::Error>> {
-    let resp_tx = Arc::new(Mutex::new(None));
-    let resp_tx2 = resp_tx.clone();
-    let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
-    let server = EchoServer { cmd_tx, resp_tx };
+    //let resp_tx = Arc::new(Mutex::new(None));
+    //let resp_tx2 = resp_tx.clone();
+    let (resp_tx, resp_rx) = mpsc::channel(4);
+    let (cmd_tx, cmd_rx) = mpsc::channel(4);
+    let server = EchoServer {
+        cmd_tx,
+        resp_rx: Mutex::new(Some(resp_rx)),
+    };
 
     tokio::spawn(async move {
         Server::builder()
@@ -176,4 +188,14 @@ async fn connect() -> Result<EchoServerClient, Box<dyn std::error::Error>> {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {}
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = connect().await?;
+    let _req = client.recv().await?;
+    client
+        .send(EchoResponse {
+            message: "Rando responso!".into(),
+        })
+        .await;
+
+    Ok(())
+}
