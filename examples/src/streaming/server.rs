@@ -42,7 +42,6 @@ fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
 pub struct EchoServer {
     cmd_tx: Sender<Result<EchoRequest, Status>>,
     resp_tx: Arc<Mutex<Option<Sender<Result<EchoResponse, Status>>>>>,
-    //resp_rx: Mutex<Receiver<Result<EchoResponse, Status>>>,
 }
 
 #[tonic::async_trait]
@@ -120,18 +119,23 @@ impl pb::echo_server::Echo for EchoServer {
     }
 }
 
-impl EchoServer {
+pub struct EchoServerClient {
+    cmd_rx: Receiver<Result<EchoRequest, Status>>,
+    resp_tx: Sender<Result<EchoResponse, Status>>,
+}
+
+impl EchoServerClient {
     async fn send(self, resp: EchoResponse) -> () {
-        let tx = self.resp_tx.lock().expect("Lock2");
-        match tx.deref() {
-            Some(tx) => tx.send(Ok(resp)).await.unwrap(),
-            None => panic!("resp_tx is None?!"),
-        };
+        self.resp_tx.send(Ok(resp)).await.unwrap()
+        //let tx = self.resp_tx.lock().expect("Lock2");
+        //match tx.deref() {
+        //    Some(tx) =>
+        //    None => panic!("resp_tx is None?!"),
+        //};
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn connect() -> Result<EchoServerClient, Box<dyn std::error::Error>> {
     let resp_tx = Arc::new(Mutex::new(None));
     let resp_tx2 = resp_tx.clone();
     let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
@@ -151,22 +155,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    message: "Oh this is a random response!".into(),
     //});
 
-    loop {
-        // this should go into recv()
-        let receive = cmd_rx.recv().await;
-        let req = receive.unwrap().unwrap();
-        println!("Received {:?}", req);
+    //loop {
+    //    // this should go into recv()
+    //    let receive = cmd_rx.recv().await;
+    //    let req = receive.unwrap().unwrap();
+    //    println!("Received {:?}", req);
 
-        // this should go into send()
-        let resp = EchoResponse {
-            message: "Oh this is a random response!".into(),
-        };
-        let tx = resp_tx2.lock().expect("Lock2");
-        match tx.deref() {
-            Some(tx) => tx.send(Ok(resp)).await.unwrap(),
-            None => panic!("resp_tx is None?!"),
-        };
-    }
+    //    // this should go into send()
+    //    let resp = EchoResponse {
+    //        message: "Oh this is a random response!".into(),
+    //    };
+    //    let tx = resp_tx2.lock().expect("Lock2");
+    //    match tx.deref() {
+    //        Some(tx) => tx.send(Ok(resp)).await.unwrap(),
+    //        None => panic!("resp_tx is None?!"),
+    //    };
+    //}
 
-    Ok(())
+    Ok(EchoServerClient { cmd_rx, resp_tx })
 }
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {}
